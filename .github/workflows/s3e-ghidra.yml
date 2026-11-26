@@ -59,12 +59,13 @@ jobs:
             exit 1
           fi
           python3 - "$RUNNER_TEMP/game.apk" "$RUNNER_TEMP/gunship-unpacked.s3e" <<'PY'
-          import hashlib, lzma, os, sys, zipfile
+          import hashlib, lzma, platform, sys, zipfile
           apk, output = sys.argv[1:3]
           expected_entry = 'assets/GUNSHIP BATTLE_aarch64.s3e'
-          expected_hash = '6d0a0f004d52a249f1b7989f20a3d6e95d750de32169dc680444e4116fa2fa8a'
+          expected_encoded_hash = 'caa3602b4287e22c2b7b62af00dfa67c7e1cf76f47e26753c3174aedf12acf03'
+          expected_payload_hash = '6d0a0f004d52a249f1b7989f20a3d6e95d750de32169dc680444e4116fa2fa8a'
           def fail(code, detail):
-              safe = ''.join(ch if ch.isalnum() or ch in ' ._:-=' else '?' for ch in detail)[:240]
+              safe = ''.join(ch if ch.isalnum() or ch in ' ._:-=' else '?' for ch in detail)[:320]
               print(f'::error title=XE3U extraction::{code}: {safe}', file=sys.stderr, flush=True)
               raise SystemExit(1)
           try:
@@ -75,20 +76,36 @@ jobs:
                       fail('ZIP_ENTRY_MISSING', 'candidates=' + ','.join(candidates[:8]))
                   info = z.getinfo(expected_entry)
                   data = z.read(expected_entry)
-                  print(f'APK_ENTRY_OK compressed={info.compress_size} expanded={info.file_size}', flush=True)
+                  encoded_hash = hashlib.sha256(data).hexdigest()
+                  print(f'APK_ENTRY_OK compressed={info.compress_size} expanded={info.file_size} sha256={encoded_hash}', flush=True)
           except zipfile.BadZipFile:
               fail('APK_NOT_VALID_ZIP', 'the downloaded APK could not be read as a ZIP archive')
           except (OSError, RuntimeError, KeyError) as exc:
               fail('APK_ENTRY_READ_FAILED', type(exc).__name__)
+          if encoded_hash != expected_encoded_hash:
+              fail('ENCODED_HASH_MISMATCH', f'python={platform.python_version()} bytes={len(data)} actual_sha256={encoded_hash}')
           if data[:4] != b'XE3U':
               try:
                   data = lzma.decompress(data, format=lzma.FORMAT_ALONE)
-              except (lzma.LZMAError, EOFError, ValueError) as exc:
-                  fail('LZMA_DECOMPRESS_FAILED', f'{type(exc).__name__} input_bytes={len(data)} prefix_hex={data[:12].hex()}')
+              except (lzma.LZMAError, EOFError, ValueError) as alone_exc:
+                  try:
+                      props = data[0]
+                      lc = props % 9
+                      rest = props // 9
+                      lp = rest % 5
+                      pb = rest // 5
+                      dictionary_size = int.from_bytes(data[1:5], 'little')
+                      if props >= 225 or pb > 4 or lc > 8 or lp > 4 or not dictionary_size:
+                          fail('LZMA_HEADER_INVALID', f'bytes={len(data)} prefix_hex={data[:13].hex()}')
+                      filters = [{'id': lzma.FILTER_LZMA1, 'dict_size': dictionary_size, 'lc': lc, 'lp': lp, 'pb': pb}]
+                      data = lzma.decompress(data[13:], format=lzma.FORMAT_RAW, filters=filters)
+                      print('LZMA_RAW_FALLBACK_OK', flush=True)
+                  except (lzma.LZMAError, EOFError, ValueError, IndexError) as raw_exc:
+                      fail('LZMA_DECOMPRESS_FAILED', f'python={platform.python_version()} alone={type(alone_exc).__name__}:{alone_exc} raw={type(raw_exc).__name__}:{raw_exc} encoded_sha256={encoded_hash}')
           digest = hashlib.sha256(data).hexdigest()
           if not data.startswith(b'XE3U'):
               fail('XE3U_MAGIC_MISSING', f'bytes={len(data)} prefix_hex={data[:12].hex()} sha256={digest}')
-          if digest != expected_hash:
+          if digest != expected_payload_hash:
               fail('PAYLOAD_HASH_MISMATCH', f'bytes={len(data)} actual_sha256={digest}')
           with open(output, 'wb') as f:
               f.write(data)
