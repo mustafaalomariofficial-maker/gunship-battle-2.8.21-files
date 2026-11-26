@@ -98,7 +98,8 @@ jobs:
               }
           }
           JAVA
-          export JAVA_TOOL_OPTIONS="-Duser.home=$GHIDRA_USER_HOME"
+          export JAVA_TOOL_OPTIONS="-Duser.home=$GHIDRA_USER_HOME -Dghidra.extensions.classpath.restricted=true -Djava.class.path.ext=$GHIDRA_HOME/Ghidra/Extensions/S3ELoader/lib/S3ELoader.jar"
+          echo 'EXTENSION_CLASSPATH_ENABLED=1'
           set +e
           "$GHIDRA_HOME/support/analyzeHeadless" "$RUNNER_TEMP/project" Gunship -import "$RUNNER_TEMP/gunship.s3e" -loader S3ELoader -overwrite -max-cpu 2 -analysisTimeoutPerFile 900 -scriptPath "$RUNNER_TEMP/scripts" -postScript Summary.java > "$RUNNER_TEMP/ghidra.log" 2>&1
           status=$?
