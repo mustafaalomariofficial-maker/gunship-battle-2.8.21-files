@@ -1,0 +1,123 @@
+name: GUNSHIP S3E headless analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gunship-s3e-analysis
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle 8.5
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Download and verify Ghidra 11.2.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241105.zip'
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/ghidra.zip"
+          echo 'ce4db5117da0fbaf8f33863fec4f40902f754f06b68945a59fb1c0f9b1bc461c  '"$RUNNER_TEMP/ghidra.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP"
+          echo "GHIDRA_HOME=$RUNNER_TEMP/ghidra_11.2.1_PUBLIC" >> "$GITHUB_ENV"
+
+      - name: Build and install S3ELoader
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/knot126/S3ELoader.git "$RUNNER_TEMP/S3ELoader"
+          git -C "$RUNNER_TEMP/S3ELoader" checkout 9baf6261da1f35a2b1fea0cd95113d82535d2f04
+          gradle --no-daemon -p "$RUNNER_TEMP/S3ELoader" -PGHIDRA_INSTALL_DIR="$GHIDRA_HOME" buildExtension
+          extension_zip="$(find "$RUNNER_TEMP/S3ELoader/dist" -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$extension_zip"
+          mkdir -p "$GHIDRA_HOME/Ghidra/Extensions"
+          unzip -q "$extension_zip" -d "$GHIDRA_HOME/Ghidra/Extensions"
+          test -n "$(find "$GHIDRA_HOME/Ghidra/Extensions" -name extension.properties -print -quit)"
+
+      - name: Extract and verify the original XE3U payload in memory workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_url='https://github.com/mustafaalomariofficial-maker/gunship-battle-2.8.21-files/releases/download/v2.8.21-unmodified/com.theonegames.gunshipbattle_2.8.21.apk'
+          curl -fL --retry 3 "$apk_url" -o "$RUNNER_TEMP/game.apk"
+          python3 - <<'PY'
+          import hashlib, lzma, zipfile, os
+          apk = os.path.join(os.environ['RUNNER_TEMP'], 'game.apk')
+          entry = 'assets/GUNSHIP BATTLE_aarch64.s3e'
+          with zipfile.ZipFile(apk) as z:
+              data = z.read(entry)
+          if data[:4] != b'XE3U':
+              data = lzma.decompress(data, format=lzma.FORMAT_ALONE)
+          digest = hashlib.sha256(data).hexdigest()
+          expected = '6d0a0f004d52a249f1b7989f20a3d6e95d750de32169dc680444e4116fa2fa8a'
+          if not data.startswith(b'XE3U') or digest != expected:
+              raise SystemExit('XE3U payload failed signature/hash verification')
+          path = os.path.join(os.environ['RUNNER_TEMP'], 'gunship-unpacked.s3e')
+          with open(path, 'wb') as f:
+              f.write(data)
+          print(f'S3E_INPUT_OK bytes={len(data)} sha256={digest}')
+          PY
+
+      - name: Run headless S3ELoader import and analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ghidra-scripts" "$RUNNER_TEMP/ghidra-project"
+          cat > "$RUNNER_TEMP/ghidra-scripts/S3ESummary.java" <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.listing.Function;
+
+          public class S3ESummary extends GhidraScript {
+              @Override
+              public void run() throws Exception {
+                  int functions = 0;
+                  for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
+                      functions++;
+                  }
+                  println("S3E_SUMMARY language=" + currentProgram.getLanguageID()
+                      + " function_count=" + functions
+                      + " min=" + currentProgram.getMinAddress()
+                      + " max=" + currentProgram.getMaxAddress());
+              }
+          }
+          JAVA
+          set +e
+          "$GHIDRA_HOME/support/analyzeHeadless" "$RUNNER_TEMP/ghidra-project" Gunship \
+            -import "$RUNNER_TEMP/gunship-unpacked.s3e" \
+            -loader S3ELoader -overwrite -max-cpu 2 -analysisTimeoutPerFile 900 \
+            -scriptPath "$RUNNER_TEMP/ghidra-scripts" -postScript S3ESummary.java \
+            > "$RUNNER_TEMP/ghidra-analysis.log" 2>&1
+          status=$?
+          set -e
+          python3 - "$RUNNER_TEMP/ghidra-analysis.log" "$status" <<'PY'
+          import re, sys
+          log = open(sys.argv[1], errors='replace').read()
+          status = int(sys.argv[2])
+          summaries = re.findall(r'S3E_SUMMARY[^\r\n]*', log)
+          print(f'GHIDRA_EXIT={status}')
+          if summaries:
+              print(summaries[-1])
+          else:
+              print('GHIDRA_SUMMARY=not-produced')
+              for line in log.splitlines():
+                  if any(word in line for word in ('Exception', 'Caused by:', 'ERROR', 'Error', 'Failed')):
+                      line = re.sub(r'(/[^\s]+)+', '<path>', line)
+                      print('DIAGNOSTIC=' + line[:200])
+          if status != 0 or not summaries:
+              raise SystemExit(1)
+          PY
