@@ -1,0 +1,111 @@
+name: GUNSHIP S3E focused string and xref scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download and verify Ghidra 11.2.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241105.zip'
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/ghidra.zip"
+          echo 'ce4db5117da0fbaf8f33863fec4f40902f754f06b68945a59fb1c0f9b1bc461c  '"$RUNNER_TEMP/ghidra.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP"
+          echo "GHIDRA_HOME=$RUNNER_TEMP/ghidra_11.2.1_PUBLIC" >> "$GITHUB_ENV"
+
+      - name: Verify payload and extract code range locally to runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/mustafaalomariofficial-maker/gunship-battle-2.8.21-files/releases/download/v2.8.21-unmodified/com.theonegames.gunshipbattle_2.8.21.apk'
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/game.apk"
+          python3 - "$RUNNER_TEMP/game.apk" "$RUNNER_TEMP/code.bin" "$GITHUB_ENV" <<'PY'
+          import hashlib, lzma, struct, sys, zipfile
+          apk, code_path, env_path = sys.argv[1:]
+          with zipfile.ZipFile(apk) as z:
+              data = z.read('assets/GUNSHIP BATTLE_aarch64.s3e')
+          if hashlib.sha256(data).hexdigest() != 'caa3602b4287e22c2b7b62af00dfa67c7e1cf76f47e26753c3174aedf12acf03':
+              raise SystemExit('APK_PAYLOAD_HASH_MISMATCH')
+          try:
+              payload = lzma.decompress(data, format=lzma.FORMAT_ALONE)
+          except lzma.LZMAError:
+              p=data[0]; lc=p%9; r=p//9; lp=r%5; pb=r//5; ds=int.from_bytes(data[1:5],'little')
+              payload=lzma.decompress(data[13:], format=lzma.FORMAT_RAW, filters=[{'id':lzma.FILTER_LZMA1,'dict_size':ds,'lc':lc,'lp':lp,'pb':pb}])
+          if not payload.startswith(b'XE3U') or hashlib.sha256(payload).hexdigest() != '6d0a0f004d52a249f1b7989f20a3d6e95d750de32169dc680444e4116fa2fa8a':
+              raise SystemExit('XE3U_PAYLOAD_VALIDATION_FAILED')
+          arch=struct.unpack_from('<H',payload,10)[0]
+          fields=struct.unpack_from('<14I',payload,12)
+          code_off,code_size,base=fields[2],fields[3],fields[10]
+          if arch & 0xff != 15 or not code_size or code_off+code_size>len(payload):
+              raise SystemExit('XE3U_CODE_RANGE_OR_ARCH_INVALID')
+          open(code_path,'wb').write(payload[code_off:code_off+code_size])
+          with open(env_path,'a') as f: f.write(f'S3E_BASE=0x{base:x}\n')
+          print(f'VERIFIED_XE3U_ARM64 bytes={len(payload)} code_bytes={code_size} base=0x{base:x}')
+          PY
+
+      - name: Analyze AArch64 and report relevant strings with xrefs only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/project" "$RUNNER_TEMP/scripts"
+          cat > "$RUNNER_TEMP/scripts/StringXrefScan.java" <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.listing.Data;
+          import ghidra.program.model.listing.Function;
+          import ghidra.program.model.symbol.Reference;
+          import ghidra.program.model.symbol.ReferenceIterator;
+          import java.util.Locale;
+          public class StringXrefScan extends GhidraScript {
+              public void run() throws Exception {
+                  String[] terms = {"purchase", "billing", "bill", "coin", "diamond", "gold", "heli", "helicopter", "aircraft", "unlock", "weapon", "currency", "tapjoy", "lan", "multiplayer", "socket", "network", "server", "http"};
+                  int hits = 0;
+                  for (Data d : currentProgram.getListing().getDefinedData(true)) {
+                      Object value;
+                      try { value = d.getValue(); } catch (Exception e) { continue; }
+                      if (!(value instanceof String)) continue;
+                      String s = (String)value;
+                      String lower = s.toLowerCase(Locale.ROOT);
+                      boolean match = false;
+                      for (String term : terms) if (lower.contains(term)) { match = true; break; }
+                      if (!match) continue;
+                      if (hits++ >= 250) { println("S3E_SCAN_TRUNCATED max_hits=250"); break; }
+                      boolean sensitive = lower.contains("token") || lower.contains("password") || lower.contains("secret") || lower.contains("credential") || lower.contains("api_key");
+                      String safe = sensitive ? "[sensitive value omitted]" : s.replaceAll("(?i)https?://\\S+", "[URL omitted]").replaceAll("[\\r\\n\\t]", " ");
+                      StringBuilder xrefs = new StringBuilder();
+                      ReferenceIterator it = currentProgram.getReferenceManager().getReferencesTo(d.getAddress());
+                      int n = 0;
+                      while (it.hasNext() && n < 8) {
+                          Reference r = it.next();
+                          Function f = currentProgram.getFunctionManager().getFunctionContaining(r.getFromAddress());
+                          if (n > 0) xrefs.append(";");
+                          xrefs.append(r.getFromAddress()).append("/").append(f == null ? "no_function" : f.getName());
+                          n++;
+                      }
+                      println("S3E_SCAN addr=" + d.getAddress() + " ref_count=" + currentProgram.getReferenceManager().getReferencesTo(d.getAddress()).hasNext() + " refs=" + xrefs + " text=" + safe);
+                  }
+                  println("S3E_SCAN_DONE matching_strings=" + hits + " language=" + currentProgram.getLanguageID());
+              }
+          }
+          JAVA
+          set +e
+          "$GHIDRA_HOME/support/analyzeHeadless" "$RUNNER_TEMP/project" GunshipScan -import "$RUNNER_TEMP/code.bin" -loader BinaryLoader -processor 'AARCH64:LE:64:v8A' -loader-baseAddr "$S3E_BASE" -overwrite -max-cpu 2 -analysisTimeoutPerFile 900 -scriptPath "$RUNNER_TEMP/scripts" -postScript StringXrefScan.java > "$RUNNER_TEMP/ghidra.log" 2>&1
+          status=$?
+          set -e
+          echo "GHIDRA_EXIT=$status"
+          grep -E 'S3E_SCAN|Exception|ERROR|Error|Failed' "$RUNNER_TEMP/ghidra.log" | tail -n 260 || true
+          test "$status" -eq 0
+          grep -q 'S3E_SCAN_DONE' "$RUNNER_TEMP/ghidra.log"
