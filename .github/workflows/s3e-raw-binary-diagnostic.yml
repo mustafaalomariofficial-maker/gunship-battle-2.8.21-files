@@ -1,0 +1,122 @@
+name: GUNSHIP S3E raw AArch64 diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download and verify Ghidra 11.2.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241105.zip'
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/ghidra.zip"
+          echo 'ce4db5117da0fbaf8f33863fec4f40902f754f06b68945a59fb1c0f9b1bc461c  '"$RUNNER_TEMP/ghidra.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP"
+          echo "GHIDRA_HOME=$RUNNER_TEMP/ghidra_11.2.1_PUBLIC" >> "$GITHUB_ENV"
+
+      - name: Download APK, verify XE3U, and extract the native code range
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/mustafaalomariofficial-maker/gunship-battle-2.8.21-files/releases/download/v2.8.21-unmodified/com.theonegames.gunshipbattle_2.8.21.apk'
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/game.apk"
+          python3 - "$RUNNER_TEMP/game.apk" "$RUNNER_TEMP/game.s3e" "$RUNNER_TEMP/code.bin" "$GITHUB_ENV" <<'PY'
+          import hashlib, lzma, struct, sys, zipfile
+          apk, s3e_path, code_path, env_path = sys.argv[1:]
+          with zipfile.ZipFile(apk) as z:
+              data = z.read('assets/GUNSHIP BATTLE_aarch64.s3e')
+          expected_compressed = 'caa3602b4287e22c2b7b62af00dfa67c7e1cf76f47e26753c3174aedf12acf03'
+          if hashlib.sha256(data).hexdigest() != expected_compressed:
+              raise SystemExit('APK_PAYLOAD_HASH_MISMATCH')
+          try:
+              payload = lzma.decompress(data, format=lzma.FORMAT_ALONE)
+          except lzma.LZMAError:
+              p = data[0]
+              lc = p % 9
+              r = p // 9
+              lp = r % 5
+              pb = r // 5
+              ds = int.from_bytes(data[1:5], 'little')
+              payload = lzma.decompress(data[13:], format=lzma.FORMAT_RAW,
+                  filters=[{'id': lzma.FILTER_LZMA1, 'dict_size': ds, 'lc': lc, 'lp': lp, 'pb': pb}])
+          digest = hashlib.sha256(payload).hexdigest()
+          if not payload.startswith(b'XE3U') or digest != '6d0a0f004d52a249f1b7989f20a3d6e95d750de32169dc680444e4116fa2fa8a':
+              raise SystemExit('XE3U_PAYLOAD_VALIDATION_FAILED')
+          if len(payload) < 68:
+              raise SystemExit('XE3U_HEADER_TOO_SHORT')
+          arch = struct.unpack_from('<H', payload, 10)[0]
+          fields = struct.unpack_from('<14I', payload, 12)
+          fixup_off, fixup_size, code_off, code_file_size, code_mem_size, sig_off, sig_size, entry_off, config_off, config_size, base_addr, extra_off, extra_size, ext_header_size = fields
+          if arch != 15:
+              raise SystemExit(f'UNEXPECTED_ARCH_INDEX={arch}')
+          if not code_file_size or code_off + code_file_size > len(payload):
+              raise SystemExit('CODE_RANGE_OUT_OF_BOUNDS')
+          if entry_off >= code_file_size:
+              raise SystemExit('ENTRY_OFFSET_OUT_OF_RANGE')
+          code = payload[code_off:code_off + code_file_size]
+          open(s3e_path, 'wb').write(payload)
+          open(code_path, 'wb').write(code)
+          with open(env_path, 'a') as f:
+              f.write(f'S3E_BASE=0x{base_addr:x}\n')
+              f.write(f'S3E_ENTRY=0x{entry_off:x}\n')
+          print(f'XE3U_OK bytes={len(payload)} sha256={digest} arch_index={arch}')
+          print(f'CODE_RANGE_OK offset=0x{code_off:x} file_bytes={code_file_size} memory_bytes={code_mem_size} entry_offset=0x{entry_off:x} base=0x{base_addr:x} ext_header_size={ext_header_size}')
+          PY
+
+      - name: Import code bytes with built-in BinaryLoader and summarize ARM64 analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/project" "$RUNNER_TEMP/scripts"
+          cat > "$RUNNER_TEMP/scripts/EntrySummary.java" <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.Address;
+          import ghidra.program.model.listing.Function;
+          public class EntrySummary extends GhidraScript {
+              public void run() throws Exception {
+                  String[] args = getScriptArgs();
+                  if (args.length != 2) throw new IllegalArgumentException("expected base and entry offset");
+                  long base = Long.decode(args[0]);
+                  long offset = Long.decode(args[1]);
+                  Address entry = toAddr(base + offset);
+                  disassemble(entry);
+                  createFunction(entry, "s3e_app_entry");
+                  int n = 0;
+                  for (Function f : currentProgram.getFunctionManager().getFunctions(true)) n++;
+                  println("RAW_AARCH64_SUMMARY language=" + currentProgram.getLanguageID() + " entry=" + entry + " functions=" + n + " min=" + currentProgram.getMinAddress() + " max=" + currentProgram.getMaxAddress());
+              }
+          }
+          JAVA
+          set +e
+          "$GHIDRA_HOME/support/analyzeHeadless" "$RUNNER_TEMP/project" GunshipRaw -import "$RUNNER_TEMP/code.bin" -loader BinaryLoader -processor 'AARCH64:LE:64:v8A' -loader-baseAddr "$S3E_BASE" -overwrite -max-cpu 2 -analysisTimeoutPerFile 900 -scriptPath "$RUNNER_TEMP/scripts" -postScript EntrySummary.java "$S3E_BASE" "$S3E_ENTRY" > "$RUNNER_TEMP/ghidra.log" 2>&1
+          status=$?
+          set -e
+          python3 - "$RUNNER_TEMP/ghidra.log" "$status" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], errors='replace').read()
+          status = int(sys.argv[2])
+          lines = re.findall(r'RAW_AARCH64_SUMMARY[^\r\n]*', text)
+          print(f'GHIDRA_EXIT={status}')
+          if lines:
+              print(lines[-1])
+          else:
+              print('GHIDRA_SUMMARY=not-produced')
+              for line in text.splitlines():
+                  if any(x in line for x in ('Exception', 'Caused by:', 'ERROR', 'Error', 'Failed')):
+                      print('DIAGNOSTIC=' + line[:240])
+          if status or not lines:
+              raise SystemExit('RAW_AARCH64_IMPORT_OR_ANALYSIS_FAILED')
+          PY
