@@ -60,7 +60,7 @@ jobs:
           arch = struct.unpack_from('<H', payload, 10)[0]
           fields = struct.unpack_from('<14I', payload, 12)
           fixup_off, fixup_size, code_off, code_file_size, code_mem_size, sig_off, sig_size, entry_off, config_off, config_size, base_addr, extra_off, extra_size, ext_header_size = fields
-          if arch != 15:
+          if (arch & 0xff) != 15:
               raise SystemExit(f'UNEXPECTED_ARCH_INDEX={arch}')
           if not code_file_size or code_off + code_file_size > len(payload):
               raise SystemExit('CODE_RANGE_OUT_OF_BOUNDS')
@@ -72,7 +72,7 @@ jobs:
           with open(env_path, 'a') as f:
               f.write(f'S3E_BASE=0x{base_addr:x}\n')
               f.write(f'S3E_ENTRY=0x{entry_off:x}\n')
-          print(f'XE3U_OK bytes={len(payload)} sha256={digest} arch_index={arch}')
+          print(f'XE3U_OK bytes={len(payload)} sha256={digest} arch_field={arch} arch_index={arch & 0xff}')
           print(f'CODE_RANGE_OK offset=0x{code_off:x} file_bytes={code_file_size} memory_bytes={code_mem_size} entry_offset=0x{entry_off:x} base=0x{base_addr:x} ext_header_size={ext_header_size}')
           PY
 
