@@ -157,6 +157,6 @@ jobs:
           status=$?
           set -e
           echo "GHIDRA_EXIT=$status"
-          grep -E '^S3E_TARGET_|Exception|ERROR|Error|Failed' "$RUNNER_TEMP/ghidra.log" | tail -n 240 || true
+          grep -E 'S3E_TARGET_|Exception|ERROR|Error|Failed' "$RUNNER_TEMP/ghidra.log" | tail -n 240 || true
           test "$status" -eq 0
           grep -q 'S3E_TARGET_AUDIT_DONE' "$RUNNER_TEMP/ghidra.log"
